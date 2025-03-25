@@ -1,8 +1,12 @@
 #!/usr/bin/env python
 from __future__ import print_function
-import sys
+
 import os
+import select
 import struct
+import sys
+import time
+
 try:
     import usocket as socket
 except ImportError:
@@ -22,7 +26,7 @@ WEBREPL_GET_FILE = 2
 WEBREPL_GET_VER  = 3
 WEBREPL_FRAME_TXT = 0x81
 WEBREPL_FRAME_BIN = 0x82
-
+IS_WINDOWS = platform.system() == "Windows"
 
 def debugmsg(msg):
     if DEBUG:
@@ -89,7 +93,7 @@ else:
             assert req == 9 and val == 2
 
 
-def login(ws, passwd):
+def login(ws :websocket, passwd):
     while True:
         c = ws.read(1, text_ok=True)
         if c == b":":
@@ -97,31 +101,27 @@ def login(ws, passwd):
             break
     ws.write(passwd.encode("utf-8") + b"\r")
 
-def read_resp(ws):
+def read_resp(ws :websocket):
     data = ws.read(4)
     sig, code = struct.unpack("<2sH", data)
     assert sig == b"WB"
     return code
 
 
-def send_req(ws, op, sz=0, fname=b""):
+def send_req(ws : websocket, op, sz=0, fname=b""):
     rec = struct.pack(WEBREPL_REQ_S, b"WA", op, 0, 0, sz, len(fname), fname)
     debugmsg("%r %d" % (rec, len(rec)))
     ws.write(rec)
 
 
-def get_ver(ws):
+def get_ver(ws : websocket):
     send_req(ws, WEBREPL_GET_VER)
     d = ws.read(3)
     d = struct.unpack("<BBB", d)
     return d
 
 
-def do_repl(ws):
-    import select
-    
-    IS_WINDOWS = platform.system() == "Windows"
-    
+def do_repl(ws:websocket):
     class ConsoleWindows:
         def __init__(self):
             import msvcrt
@@ -129,23 +129,23 @@ def do_repl(ws):
             self.infd = sys.stdin.fileno()
             self.infile = sys.stdin.buffer.raw if hasattr(sys.stdin, 'buffer') else sys.stdin
             self.outfile = sys.stdout.buffer.raw if hasattr(sys.stdout, 'buffer') else sys.stdout
-            
+
         def enter(self):
             # No special terminal setup needed on Windows
             pass
-            
+
         def exit(self):
             # No special terminal cleanup needed on Windows
             pass
-            
+
         def readchar(self):
             if self.msvcrt.kbhit():
                 return self.msvcrt.getch()
             return None
-            
+
         def write(self, buf):
             self.outfile.write(buf)
-            
+
     class ConsolePosix:
         def __init__(self):
             import termios
@@ -182,12 +182,8 @@ def do_repl(ws):
             self.outfile.write(buf)
 
     print("Use Ctrl-] to exit this shell")
-    
-    if IS_WINDOWS:
-        console = ConsoleWindows()
-    else:
-        console = ConsolePosix()
-        
+
+    console = ConsoleWindows() if IS_WINDOWS else ConsolePosix()
     console.enter()
     try:
         while True:
@@ -204,13 +200,13 @@ def do_repl(ws):
                 sel = select.select([console.infd, ws.s], [], [])
                 c = console.readchar()
                 ws_ready = ws.s in sel[0]
-            
+
             if c:
                 if c == b"\x1d":  # ctrl-], exit
                     break
                 else:
                     ws.write(c, WEBREPL_FRAME_TXT)
-            
+
             if ws_ready:
                 c = ws.read(1, text_ok=True)
                 while c is not None:
@@ -275,6 +271,55 @@ def get_file(ws, local_file, remote_file):
     assert read_resp(ws) == 0
 
 
+def do_file_upload(ws:websocket, filename, auto_exit=False):
+    """Read a file and send its contents line by line to the REPL."""
+    print(f"Sending file {filename} to REPL...")
+    try:
+        # TODO:  enter raw / raw-paste mode
+        
+        # Read the file and send its contents line by line
+        with open(filename, "r") as f:
+            for line in f:
+                ws.write(line.encode('utf-8'), WEBREPL_FRAME_TXT)
+                ws.write(b"\r", WEBREPL_FRAME_TXT)
+                time.sleep(0.2)  # Small , but large enough delay to allow processing of each line
+
+        # TODO:  exit raw / raw-paste mode
+        
+        # Wait for processing after sending file
+        time.sleep(5)
+        
+        # Display output from device after file is sent
+        ws_ready = False
+        try:
+            # Check if data available from WebREPL
+            ws_ready = len(select.select([ws.s], [], [], 0.2)[0]) > 0
+        except:
+            pass
+        
+        if ws_ready:
+            c = ws.read(1, text_ok=True)
+            while c is not None:
+                oc = ord(c)
+                if oc in {8, 9, 10, 13, 27} or oc >= 32:
+                    sys.stdout.buffer.write(c)
+                else:
+                    sys.stdout.buffer.write(b"[%02x]" % ord(c))
+                sys.stdout.flush()
+                c = ws.read(1) if ws.buf else None
+                
+        # Wait for a final 200ms after file transfer is complete
+        if auto_exit:
+            time.sleep(0.2)
+            # Send Ctrl-] to exit the REPL if auto_exit is True
+            ws.write(b"\x1d", WEBREPL_FRAME_TXT)
+
+        print(f"\nFile {filename} sent successfully.")
+        return True
+    except Exception as e:
+        print(f"Error sending file: {e}")
+        return False
+
 def help(rc=0):
     exename = sys.argv[0].rsplit("/", 1)[-1]
     print(
@@ -282,11 +327,12 @@ def help(rc=0):
         % exename
     )
     print("Arguments:")
-    print("  [-p password] <host>                            - Access the remote REPL")
+    print("  [-p password] [-f file_to_upload] <host>        - Access the remote REPL")
     print("  [-p password] <host>:<remote_file> <local_file> - Copy remote file to local file")
     print("  [-p password] <local_file> <host>:<remote_file> - Copy local file to remote file")
     print("Examples:")
     print("  %s 192.168.4.1" % exename)
+    print("  %s -f script.py 192.168.4.1" % exename)
     print("  %s script.py 192.168.4.1:/another_name.py" % exename)
     print("  %s script.py 192.168.4.1:/app/" % exename)
     print("  %s -p password 192.168.4.1:/app/script.py ." % exename)
@@ -331,11 +377,21 @@ Sec-WebSocket-Key: foo\r
 
 def main():
     passwd = None
-    for i in range(len(sys.argv)):
+    upload_file = None
+    stay_in_repl = True
+    
+    i = 0
+    while i < len(sys.argv):
         if sys.argv[i] == '-p':
             sys.argv.pop(i)
             passwd = sys.argv.pop(i)
-            break
+        elif sys.argv[i] == '-f':
+            sys.argv.pop(i)
+            upload_file = sys.argv.pop(i)
+            # If -f option is used, default to not staying in REPL
+            stay_in_repl = False
+        else:
+            i += 1
 
     if len(sys.argv) not in (2, 3):
         help(1)
@@ -382,7 +438,7 @@ def main():
     #s = s.makefile("rwb")
     client_handshake(s)
 
-    ws = websocket(s)
+    ws : websocket = websocket(s)
 
     login(ws, passwd)
     print("Remote WebREPL version:", get_ver(ws))
@@ -391,6 +447,16 @@ def main():
     ws.ioctl(9, 2)
 
     if op == "repl":
+        if upload_file:
+            # Upload file with auto-exit flag set
+            do_file_upload(ws, upload_file, auto_exit=not stay_in_repl)
+            
+            if not stay_in_repl:
+                # Auto-exit has already been handled in do_file_upload
+                print("Auto-exiting REPL session after file upload.")
+                return
+        
+        # If we're still here, enter the interactive REPL
         do_repl(ws)
     elif op == "get":
         get_file(ws, dst_file, src_file)
