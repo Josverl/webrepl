@@ -7,6 +7,7 @@ try:
     import usocket as socket
 except ImportError:
     import socket
+import platform
 
 # Define to 1 to use builtin "uwebsocket" module of MicroPython
 USE_BUILTIN_UWEBSOCKET = 0
@@ -117,10 +118,38 @@ def get_ver(ws):
 
 
 def do_repl(ws):
-    import termios, select
-
+    import select
+    
+    IS_WINDOWS = platform.system() == "Windows"
+    
+    class ConsoleWindows:
+        def __init__(self):
+            import msvcrt
+            self.msvcrt = msvcrt
+            self.infd = sys.stdin.fileno()
+            self.infile = sys.stdin.buffer.raw if hasattr(sys.stdin, 'buffer') else sys.stdin
+            self.outfile = sys.stdout.buffer.raw if hasattr(sys.stdout, 'buffer') else sys.stdout
+            
+        def enter(self):
+            # No special terminal setup needed on Windows
+            pass
+            
+        def exit(self):
+            # No special terminal cleanup needed on Windows
+            pass
+            
+        def readchar(self):
+            if self.msvcrt.kbhit():
+                return self.msvcrt.getch()
+            return None
+            
+        def write(self, buf):
+            self.outfile.write(buf)
+            
     class ConsolePosix:
         def __init__(self):
+            import termios
+            self.termios = termios
             self.infd = sys.stdin.fileno()
             self.infile = sys.stdin.buffer.raw
             self.outfile = sys.stdout.buffer.raw
@@ -128,19 +157,19 @@ def do_repl(ws):
 
         def enter(self):
             # attr is: [iflag, oflag, cflag, lflag, ispeed, ospeed, cc]
-            attr = termios.tcgetattr(self.infd)
+            attr = self.termios.tcgetattr(self.infd)
             attr[0] &= ~(
-                termios.BRKINT | termios.ICRNL | termios.INPCK | termios.ISTRIP | termios.IXON
+                self.termios.BRKINT | self.termios.ICRNL | self.termios.INPCK | self.termios.ISTRIP | self.termios.IXON
             )
             attr[1] = 0
-            attr[2] = attr[2] & ~(termios.CSIZE | termios.PARENB) | termios.CS8
+            attr[2] = attr[2] & ~(self.termios.CSIZE | self.termios.PARENB) | self.termios.CS8
             attr[3] = 0
-            attr[6][termios.VMIN] = 1
-            attr[6][termios.VTIME] = 0
-            termios.tcsetattr(self.infd, termios.TCSANOW, attr)
+            attr[6][self.termios.VMIN] = 1
+            attr[6][self.termios.VTIME] = 0
+            self.termios.tcsetattr(self.infd, self.termios.TCSANOW, attr)
 
         def exit(self):
-            termios.tcsetattr(self.infd, termios.TCSANOW, self.orig_attr)
+            self.termios.tcsetattr(self.infd, self.termios.TCSANOW, self.orig_attr)
 
         def readchar(self):
             res = select.select([self.infd], [], [], 0)
@@ -153,18 +182,36 @@ def do_repl(ws):
             self.outfile.write(buf)
 
     print("Use Ctrl-] to exit this shell")
-    console = ConsolePosix()
+    
+    if IS_WINDOWS:
+        console = ConsoleWindows()
+    else:
+        console = ConsolePosix()
+        
     console.enter()
     try:
         while True:
-            sel = select.select([console.infd, ws.s], [], [])
-            c = console.readchar()
+            if IS_WINDOWS:
+                # Windows doesn't support select on stdin, so we poll differently
+                c = console.readchar()
+                ws_ready = False
+                try:
+                    # Simple non-blocking check if data available
+                    ws_ready = len(select.select([ws.s], [], [], 0)[0]) > 0
+                except:
+                    pass
+            else:
+                sel = select.select([console.infd, ws.s], [], [])
+                c = console.readchar()
+                ws_ready = ws.s in sel[0]
+            
             if c:
                 if c == b"\x1d":  # ctrl-], exit
                     break
                 else:
                     ws.write(c, WEBREPL_FRAME_TXT)
-            if ws.s in sel[0]:
+            
+            if ws_ready:
                 c = ws.read(1, text_ok=True)
                 while c is not None:
                     # pass character through to the console
